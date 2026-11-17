@@ -1,3 +1,0 @@
-
-winrt-Windows.Devices.Bluetooth
-winrt-Windows.Devices.Enumeration
