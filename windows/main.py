@@ -1,5 +1,7 @@
 
 import asyncio
+import time
+
 from datetime import datetime
 
 from winrt.windows.devices.bluetooth import (
@@ -12,6 +14,7 @@ from winrt.windows.devices.enumeration import (
 )
 
 from database.local_db import LocalDatabase
+from config import TRACKED_DEVICE_NAMES
 
 
 class BluetoothMonitor:
@@ -22,27 +25,69 @@ class BluetoothMonitor:
 
         self.loop = None
         self.queue = None
-
         self.watcher = None
 
-        # Keep device objects and event tokens alive.
+        # Active device subscriptions
         self.devices = {}
 
+        # Watcher event tokens
         self.watcher_tokens = []
 
-    def timestamp(self):
+    # ---------------------------------
+    # Device filtering
+    # ---------------------------------
+
+    @staticmethod
+    def is_tracked_device(name):
+
+        if not name:
+            return False
+
+        normalized_name = name.casefold().strip()
+
+        return any(
+            keyword.casefold() in normalized_name
+            for keyword in TRACKED_DEVICE_NAMES
+            if keyword.strip()
+        )
+
+    # ---------------------------------
+    # Time utilities
+    # ---------------------------------
+
+    @staticmethod
+    def timestamp():
 
         return datetime.now().astimezone().strftime(
             "%Y-%m-%d %H:%M:%S"
+        )
+
+    @staticmethod
+    def format_duration(seconds):
+
+        total_seconds = max(0, int(seconds))
+
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+
+        return (
+            f"{hours:02d}:"
+            f"{minutes:02d}:"
+            f"{seconds:02d}"
         )
 
     def print_event(self, name, state):
 
         print(
             f"[{self.timestamp()}] "
-            f"{state:12} | {name}",
+            f"{state:14} | {name}",
             flush=True
         )
+
+    # ---------------------------------
+    # Thread-safe event queue
+    # ---------------------------------
 
     def queue_event(self, event):
 
@@ -52,7 +97,7 @@ class BluetoothMonitor:
         )
 
     # ---------------------------------
-    # Device watcher event callbacks
+    # Windows watcher callbacks
     # ---------------------------------
 
     def on_device_added(self, sender, info):
@@ -68,7 +113,7 @@ class BluetoothMonitor:
         self.queue_event((
             "UPDATE",
             info.id,
-            ""
+            info.name
         ))
 
     def on_device_removed(self, sender, info):
@@ -87,13 +132,50 @@ class BluetoothMonitor:
             ""
         ))
 
+    
+    
+    def show_daily_summary(self):
+
+        summary = self.db.get_daily_usage()
+
+        total = summary["total_seconds"]
+
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        seconds = total % 60
+
+        print("\nTODAY'S USAGE")
+        print("-" * 55)
+
+        print(
+            f"Total usage: "
+            f"{hours}h {minutes}m {seconds}s"
+        )
+
+        for name, duration in summary["devices"].items():
+
+            h = duration // 3600
+            m = (duration % 3600) // 60
+            s = duration % 60
+
+            print(
+                f"{name}: {h}h {m}m {s}s"
+            )
+
+        print("-" * 55)
+
+
+
     # ---------------------------------
-    # Attach to a Bluetooth device
+    # Attach to a headphone
     # ---------------------------------
 
     async def attach_device(self, os_device_id, name):
 
         if os_device_id in self.devices:
+            return
+
+        if not self.is_tracked_device(name):
             return
 
         try:
@@ -105,13 +187,17 @@ class BluetoothMonitor:
             if device is None:
                 return
 
-            device_name = device.name or name or "Unknown device"
+            device_name = device.name or name
+
+            # Verify using the actual device name too.
+            if not self.is_tracked_device(device_name):
+                return
 
             device_key = self.db.make_device_key(
                 os_device_id
             )
 
-            # Subscribe to connection changes.
+            # Connection state callback
             def on_connection_changed(sender, args):
 
                 connected = (
@@ -130,18 +216,25 @@ class BluetoothMonitor:
                 on_connection_changed
             )
 
-            self.devices[os_device_id] = {
-                "device": device,
-                "token": token,
-                "name": device_name,
-                "key": device_key
-            }
-
-            # Read current state once.
+            # Read the initial connection state.
             connected = (
                 device.connection_status
                 == BluetoothConnectionStatus.CONNECTED
             )
+
+            self.devices[os_device_id] = {
+                "device": device,
+                "token": token,
+                "name": device_name,
+                "key": device_key,
+                "connected": connected,
+
+                # None means the session began before
+                # this monitor started.
+                "session_started": (
+                    None if connected else None
+                )
+            }
 
             self.db.record_status(
                 device_key,
@@ -152,8 +245,15 @@ class BluetoothMonitor:
 
             self.print_event(
                 device_name,
-                "CONNECTED" if connected else "DISCONNECTED"
+                "CONNECTED" if connected
+                else "DISCONNECTED"
             )
+
+            if connected:
+                print(
+                    "  Session start unknown: "
+                    "device was already connected at startup."
+                )
 
         except Exception as error:
 
@@ -161,6 +261,67 @@ class BluetoothMonitor:
                 f"Could not monitor {name}: {error}",
                 flush=True
             )
+
+    # ---------------------------------
+    # Connection state changes
+    # ---------------------------------
+
+    def process_status(
+        self,
+        os_device_id,
+        name,
+        connected
+    ):
+
+        entry = self.devices.get(os_device_id)
+
+        if entry is None:
+            return
+
+        previous_state = entry["connected"]
+
+        # Ignore duplicate notifications.
+        if previous_state == connected:
+            return
+
+        entry["connected"] = connected
+
+        self.db.record_status(
+            entry["key"],
+            name,
+            connected
+        )
+
+        if connected:
+
+            # Start a new session timer.
+            entry["session_started"] = time.monotonic()
+
+            self.print_event(name, "CONNECTED")
+
+        else:
+
+            start = entry["session_started"]
+
+            self.print_event(name, "DISCONNECTED")
+
+            if start is not None:
+
+                duration = time.monotonic() - start
+
+                print(
+                    "  Session duration: "
+                    + self.format_duration(duration)
+                )
+
+            else:
+
+                print(
+                    "  Session duration unavailable: "
+                    "connection began before monitoring."
+                )
+
+            entry["session_started"] = None
 
     # ---------------------------------
     # Remove device subscription
@@ -181,14 +342,53 @@ class BluetoothMonitor:
 
         except Exception as error:
 
-            print("Event cleanup warning:", error)
-
-        print(
-            f"Device removed from watcher: {entry['name']}"
-        )
+            print("Cleanup warning:", error)
 
     # ---------------------------------
-    # Start monitoring
+    # Display current status
+    # ---------------------------------
+
+    def show_active_sessions(self):
+
+        print("\nACTIVE HEADPHONE SESSIONS")
+        print("-" * 55)
+
+        active_count = 0
+
+        for entry in self.devices.values():
+
+            if not entry["connected"]:
+                continue
+
+            active_count += 1
+
+            start = entry["session_started"]
+
+            print(f"Device: {entry['name']}")
+
+            if start is not None:
+
+                duration = time.monotonic() - start
+
+                print(
+                    "Duration: "
+                    + self.format_duration(duration)
+                )
+
+            else:
+
+                print(
+                    "Duration: Unknown "
+                    "(connected before monitor startup)"
+                )
+
+        if active_count == 0:
+            print("No tracked headphones currently connected.")
+
+        print("-" * 55)
+
+    # ---------------------------------
+    # Main monitoring loop
     # ---------------------------------
 
     async def run(self):
@@ -199,10 +399,9 @@ class BluetoothMonitor:
         selector = BluetoothDevice.get_device_selector()
 
         self.watcher = DeviceInformation.create_watcher_aqs_filter(
-        selector
+            selector
         )
 
-        # Register Windows device watcher events.
         self.watcher_tokens = [
             self.watcher.add_added(self.on_device_added),
             self.watcher.add_updated(self.on_device_updated),
@@ -215,8 +414,14 @@ class BluetoothMonitor:
         print("=" * 55)
         print("       HEADPHONE TRACKER - WINDOWS")
         print("=" * 55)
+
         print("Starting Bluetooth monitoring...")
-        print("Press CTRL+C to stop.")
+        print("Tracked devices:")
+
+        for name in TRACKED_DEVICE_NAMES:
+            print(f"  - {name}")
+
+        print("\nPress CTRL+C to stop.")
         print("=" * 55)
 
         self.watcher.start()
@@ -253,21 +458,10 @@ class BluetoothMonitor:
 
                     _, device_id, name, connected = event
 
-                    entry = self.devices.get(device_id)
-
-                    if entry is None:
-                        continue
-
-                    self.db.record_status(
-                        entry["key"],
+                    self.process_status(
+                        device_id,
                         name,
                         connected
-                    )
-
-                    self.print_event(
-                        name,
-                        "CONNECTED" if connected
-                        else "DISCONNECTED"
                     )
 
                 elif event_type == "REMOVE":
@@ -279,20 +473,23 @@ class BluetoothMonitor:
                 elif event_type == "ENUMERATION_COMPLETED":
 
                     print(
-                        "Initial Bluetooth device enumeration completed."
+                        "\nInitial Bluetooth enumeration completed."
                     )
+
+                self.show_active_sessions()
+                self.show_daily_summary()
 
         finally:
 
             print("\nStopping Bluetooth monitor...")
 
+            self.show_active_sessions()
+
             self.watcher.stop()
 
-            # Unsubscribe all Bluetooth device events.
             for device_id in list(self.devices.keys()):
                 self.remove_device(device_id)
 
-            # Unsubscribe watcher events.
             for token, remove_method in zip(
                 self.watcher_tokens,
                 [
