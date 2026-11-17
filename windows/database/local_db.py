@@ -503,6 +503,21 @@ class LocalDatabase:
         }
 
     # ---------------------------------
+    # Daily usage history
+    # ---------------------------------
+
+    def get_usage_history(self, days=7):
+        """Return daily summaries for today and the previous days."""
+        if days < 1:
+            raise ValueError("days must be at least 1")
+
+        today = datetime.now().astimezone().date()
+        return [
+            self.get_daily_usage(today - timedelta(days=offset))
+            for offset in range(days)
+        ]
+
+    # ---------------------------------
     # Recent session history
     # ---------------------------------
 

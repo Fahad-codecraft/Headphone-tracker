@@ -136,34 +136,58 @@ class BluetoothMonitor:
     
     def show_daily_summary(self):
 
-        summary = self.db.get_daily_usage()
+        history = self.db.get_usage_history(days=7)
 
-        total = summary["total_seconds"]
+        def format_usage(total_seconds):
+            total_seconds = max(0, int(total_seconds))
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            seconds = total_seconds % 60
+            return f"{hours}h {minutes}m {seconds}s"
 
-        hours = total // 3600
-        minutes = (total % 3600) // 60
-        seconds = total % 60
+        today = history[0]
+        yesterday = history[1] if len(history) > 1 else {
+            "total_seconds": 0,
+            "devices": {},
+        }
 
-        print("\nTODAY'S USAGE")
-        print("-" * 55)
-
-        print(
-            f"Total usage: "
-            f"{hours}h {minutes}m {seconds}s"
+        seven_day_total = sum(
+            day["total_seconds"] for day in history
         )
 
-        for name, duration in summary["devices"].items():
+        seven_day_devices = {}
+        for day in history:
+            for name, seconds in day["devices"].items():
+                seven_day_devices[name] = (
+                    seven_day_devices.get(name, 0) + seconds
+                )
 
-            h = duration // 3600
-            m = (duration % 3600) // 60
-            s = duration % 60
+        print("\\nUSAGE HISTORY")
+        print("-" * 55)
+        print(f"Today:     {format_usage(today['total_seconds'])}")
+        print(f"Yesterday: {format_usage(yesterday['total_seconds'])}")
+        print(
+            "Last 7 days: "
+            f"{format_usage(seven_day_total)} "
+            "(including today)"
+        )
 
+        print("\\nDAILY BREAKDOWN")
+        for day in history:
+            day_label = datetime.fromisoformat(
+                day["date"]
+            ).strftime("%a, %d %b")
             print(
-                f"{name}: {h}h {m}m {s}s"
+                f"{day_label}: "
+                f"{format_usage(day['total_seconds'])}"
             )
 
-        print("-" * 55)
+        if seven_day_devices:
+            print("\\nPER-HEADPHONE TOTAL (LAST 7 DAYS)")
+            for name, seconds in seven_day_devices.items():
+                print(f"{name}: {format_usage(seconds)}")
 
+        print("-" * 55)
 
 
     # ---------------------------------
@@ -476,8 +500,9 @@ class BluetoothMonitor:
                         "\nInitial Bluetooth enumeration completed."
                     )
 
-                self.show_active_sessions()
-                self.show_daily_summary()
+                if event_type in ("STATUS", "ENUMERATION_COMPLETED"):
+                    self.show_active_sessions()
+                    self.show_daily_summary()
 
         finally:
 
