@@ -435,7 +435,15 @@ class LocalDatabase:
     # ---------------------------------
 
     def get_daily_usage(self, day=None):
+        """Return per-device time and combined unique connected time.
 
+        Overlapping intervals from different tracked devices are counted once
+        in total_seconds. Per-device values remain independent, so their sum
+        can be greater than the combined unique total.
+
+        Sessions with an unknown start time are intentionally excluded: their
+        true duration cannot be established reliably.
+        """
         if day is None:
             day = datetime.now().astimezone().date()
 
@@ -451,14 +459,11 @@ class LocalDatabase:
 
         day_start = local_start.astimezone(timezone.utc)
         day_end = local_end.astimezone(timezone.utc)
-
         now = utc_now()
 
         cursor = self.connection.cursor()
-
         cursor.execute("""
-            SELECT device_key, device_name,
-                   start_utc, end_utc
+            SELECT device_key, device_name, start_utc, end_utc
             FROM connection_sessions
             WHERE start_utc IS NOT NULL
               AND start_utc < ?
@@ -468,37 +473,48 @@ class LocalDatabase:
             utc_string(day_start)
         ))
 
-        total_seconds = 0
         per_device = {}
+        all_intervals = []
+        individual_total_seconds = 0
 
         for device_key, name, start_value, end_value in cursor.fetchall():
-
             start = parse_utc(start_value)
+            end = parse_utc(end_value) if end_value else now
 
-            end = (
-                parse_utc(end_value)
-                if end_value
-                else now
-            )
-
-            # Clip session to this local calendar day.
             clipped_start = max(start, day_start)
             clipped_end = min(end, day_end, now)
+            if clipped_end <= clipped_start:
+                continue
 
-            seconds = max(
-                0,
-                int((clipped_end - clipped_start).total_seconds())
-            )
+            # Keep precise datetimes for unioning; round only final totals.
+            all_intervals.append((clipped_start, clipped_end))
+            seconds = max(0, int((clipped_end - clipped_start).total_seconds()))
+            per_device[name] = per_device.get(name, 0) + seconds
+            individual_total_seconds += seconds
 
-            total_seconds += seconds
+        # Merge overlapping or touching intervals across all devices.
+        all_intervals.sort(key=lambda interval: interval[0])
+        merged_seconds = 0.0
+        if all_intervals:
+            merged_start, merged_end = all_intervals[0]
+            for interval_start, interval_end in all_intervals[1:]:
+                if interval_start <= merged_end:
+                    merged_end = max(merged_end, interval_end)
+                else:
+                    merged_seconds += (merged_end - merged_start).total_seconds()
+                    merged_start, merged_end = interval_start, interval_end
+            merged_seconds += (merged_end - merged_start).total_seconds()
 
-            per_device[name] = (
-                per_device.get(name, 0) + seconds
-            )
+        unique_total_seconds = max(0, int(merged_seconds))
 
         return {
             "date": str(day),
-            "total_seconds": total_seconds,
+            # Backwards-compatible field used by the dashboard and charts.
+            # It now represents combined unique time, not the sum of devices.
+            "total_seconds": unique_total_seconds,
+            "unique_total_seconds": unique_total_seconds,
+            "individual_total_seconds": individual_total_seconds,
+            "overlap_seconds": max(0, individual_total_seconds - unique_total_seconds),
             "devices": per_device
         }
 
